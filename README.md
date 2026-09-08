@@ -13,6 +13,7 @@ It does **not** go through the Windows recording mixer for the settings we own. 
 - Opens capture only when you talk or test the mic; closes it after, so Bluetooth can return to A2DP.
 - Rebuilds codec + recorder after a level change (stock GoldSrc never does).
 - Applies `mv_gain` / `mv_boost` in software on 16-bit PCM **before** Speex (Windows recording mixer is pinned to unity so it is not a second fader).
+- Noise gate (`mv_gate`) zeros packets below the threshold so keyboard/breath is not sent.
 - Registers those cvars for the Options UI (`FCVAR_ARCHIVE` → `config.cfg`).
 
 ## Cvars
@@ -21,6 +22,7 @@ It does **not** go through the Windows recording mixer for the settings we own. 
 |---|---|---|
 | `mv_gain` | `1.0` | Transmit level, 0–1. Replaces Windows “Voice transmit volume”. |
 | `mv_boost` | `0` | Extra gain on/off. Replaces Windows “Boost microphone gain”. |
+| `mv_gate` | `0` | Noise gate threshold (0 = off, ~0.15 = tight). Applied on raw PCM. |
 
 Do not load **VoiceFix.dll** and **MetaVoice.dll** together.
 
@@ -47,8 +49,7 @@ MetaVoice.dll
 
 ## Roadmap
 
-1. Noise gate (`mv_gate`) so keyboard/breath is not sent.
-2. Capture device pick if more than one mic is present.
+1. Capture device pick if a machine has more than one useful WaveIn input.
 
 Per-player **incoming** voice volume (Next Client style) is a playback-side feature, not this plugin.
 

@@ -2,7 +2,9 @@
 #include <cvardef.h>
 #include <ivoicetweak.h>
 #include <mmsystem.h>
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 static void Log(const char *msg)
@@ -107,6 +109,9 @@ static const unsigned char kReplacement[2] = { 0x33, 0xC0 }; /* XOR EAX,EAX */
 
 /* Windows "Mic Boost" is +20 dB. Keep the same extra when mv_boost is on. */
 #define MV_BOOST_LINEAR 10.0f
+/* Slider 0–100 maps onto this peak-ish RMS band. 0 disables the gate. */
+#define MV_GATE_MAX 0.15f
+#define MV_GATE_HOLD 8
 
 /* FUN_01dc33e0 -- the release-side counterpart called from -voicerecord
  * and from the Options "Stop Microphone Test" button: flushes the
@@ -164,6 +169,11 @@ static bool g_isDSound = false;
 static bool g_hwOpened = false;
 static bool g_recorderEverBuilt = false; /* true once we know how to rebuild (class + rate) */
 static cl_enginefunc_t *g_eng = NULL;
+static int g_gateOpen = 1;
+static int g_gateHold = 0;
+
+static void CloseWaveInHardware(void *pThis);
+static void PinWindowsMixerUnity(void);
 
 cl_exportfuncs_t gExportfuncs = { 0 };
 mh_interface_t *g_pInterface = NULL;
@@ -182,6 +192,50 @@ static float CvarValueOr(const char *name, float fallback)
         return fallback;
     }
     return cv->value;
+}
+
+static void ApplyNoiseGate(short *buf, int nSamples)
+{
+    float gate;
+    float rms;
+    double acc;
+    int i;
+
+    if (buf == NULL || nSamples <= 0) {
+        return;
+    }
+    gate = CvarValueOr("mv_gate", 0.0f);
+    if (gate < 0.0f) {
+        gate = 0.0f;
+    }
+    if (gate > MV_GATE_MAX) {
+        gate = MV_GATE_MAX;
+    }
+    if (gate < 0.0005f) {
+        g_gateOpen = 1;
+        g_gateHold = 0;
+        return;
+    }
+
+    acc = 0.0;
+    for (i = 0; i < nSamples; i++) {
+        double s = (double)buf[i];
+        acc += s * s;
+    }
+    rms = (float)sqrt(acc / (double)nSamples) / 32768.0f;
+
+    if (rms >= gate) {
+        g_gateOpen = 1;
+        g_gateHold = MV_GATE_HOLD;
+    } else if (g_gateHold > 0) {
+        g_gateHold--;
+    } else if (rms < gate * 0.65f) {
+        g_gateOpen = 0;
+    }
+
+    if (!g_gateOpen) {
+        memset(buf, 0, (size_t)nSamples * sizeof(short));
+    }
 }
 
 static void PinWindowsMixerUnity(void)
@@ -211,6 +265,8 @@ static void ApplyCaptureGain(short *buf, int nSamples)
     if (buf == NULL || nSamples <= 0) {
         return;
     }
+
+    ApplyNoiseGate(buf, nSamples);
 
     gain = CvarValueOr("mv_gain", 1.0f);
     if (gain < 0.0f) {
@@ -559,6 +615,9 @@ static void RegisterGainCvars(void)
     if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_boost") == NULL) {
         g_eng->pfnRegisterVariable("mv_boost", "0", FCVAR_ARCHIVE);
     }
+    if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_gate") == NULL) {
+        g_eng->pfnRegisterVariable("mv_gate", "0", FCVAR_ARCHIVE);
+    }
 }
 
 void IPluginsV4::LoadEngine(cl_enginefunc_t *pEngineFuncs)
@@ -581,7 +640,7 @@ void IPluginsV4::ExitGame(int iResult)
 
 const char *IPluginsV4::GetVersion(void)
 {
-    return "0.2.0";
+    return "0.3.0";
 }
 
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
