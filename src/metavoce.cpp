@@ -171,6 +171,8 @@ static bool g_recorderEverBuilt = false; /* true once we know how to rebuild (cl
 static cl_enginefunc_t *g_eng = NULL;
 static int g_gateOpen = 1;
 static int g_gateHold = 0;
+static float g_vuHoldL = 0.0f;
+static float g_vuHoldR = 0.0f;
 
 static void CloseWaveInHardware(void *pThis);
 static void PinWindowsMixerUnity(void);
@@ -255,6 +257,87 @@ static void PinWindowsMixerUnity(void)
     tweak->SetControlFloat(MicBoost, 0.0f);
 }
 
+static void SetVuCvar(const char *name, float v)
+{
+    cvar_t *cv;
+
+    if (g_eng == NULL || g_eng->pfnGetCvarPointer == NULL || name == NULL) {
+        return;
+    }
+    if (v < 0.0f) {
+        v = 0.0f;
+    }
+    if (v > 1.0f) {
+        v = 1.0f;
+    }
+    cv = g_eng->pfnGetCvarPointer(name);
+    if (cv != NULL) {
+        cv->value = v;
+    }
+}
+
+static void UpdateVuMeters(const short *buf, int nSamples)
+{
+    float peakL = 0.0f;
+    float peakR = 0.0f;
+    int i;
+
+    if (buf == NULL || nSamples <= 0) {
+        g_vuHoldL *= 0.86f;
+        g_vuHoldR *= 0.86f;
+        SetVuCvar("mv_vu_l", g_vuHoldL);
+        SetVuCvar("mv_vu_r", g_vuHoldR);
+        return;
+    }
+    if (nSamples >= 2) {
+        for (i = 0; i + 1 < nSamples; i += 2) {
+            float a = (float)buf[i];
+            float b = (float)buf[i + 1];
+            if (a < 0.0f) {
+                a = -a;
+            }
+            if (b < 0.0f) {
+                b = -b;
+            }
+            a /= 32768.0f;
+            b /= 32768.0f;
+            if (a > peakL) {
+                peakL = a;
+            }
+            if (b > peakR) {
+                peakR = b;
+            }
+        }
+    } else {
+        peakL = (float)buf[0];
+        if (peakL < 0.0f) {
+            peakL = -peakL;
+        }
+        peakL /= 32768.0f;
+        peakR = peakL;
+    }
+    peakL *= 3.2f;
+    peakR *= 3.2f;
+    if (peakL > 1.0f) {
+        peakL = 1.0f;
+    }
+    if (peakR > 1.0f) {
+        peakR = 1.0f;
+    }
+    if (peakL > g_vuHoldL) {
+        g_vuHoldL = peakL;
+    } else {
+        g_vuHoldL *= 0.86f;
+    }
+    if (peakR > g_vuHoldR) {
+        g_vuHoldR = peakR;
+    } else {
+        g_vuHoldR *= 0.86f;
+    }
+    SetVuCvar("mv_vu_l", g_vuHoldL);
+    SetVuCvar("mv_vu_r", g_vuHoldR);
+}
+
 static void ApplyCaptureGain(short *buf, int nSamples)
 {
     float gain;
@@ -263,6 +346,7 @@ static void ApplyCaptureGain(short *buf, int nSamples)
     int i;
 
     if (buf == NULL || nSamples <= 0) {
+        UpdateVuMeters(NULL, 0);
         return;
     }
 
@@ -282,19 +366,18 @@ static void ApplyCaptureGain(short *buf, int nSamples)
     }
 
     scale = gain * boost;
-    if (scale == 1.0f) {
-        return;
-    }
-
-    for (i = 0; i < nSamples; i++) {
-        int v = (int)((float)buf[i] * scale);
-        if (v > 32767) {
-            v = 32767;
-        } else if (v < -32768) {
-            v = -32768;
+    if (scale != 1.0f) {
+        for (i = 0; i < nSamples; i++) {
+            int v = (int)((float)buf[i] * scale);
+            if (v > 32767) {
+                v = 32767;
+            } else if (v < -32768) {
+                v = -32768;
+            }
+            buf[i] = (short)v;
         }
-        buf[i] = (short)v;
     }
+    UpdateVuMeters(buf, nSamples);
 }
 
 static int __fastcall Hook_WaveInGetMoreData(void *pThis, void *edx, short *buf, int nSamples)
@@ -617,6 +700,12 @@ static void RegisterGainCvars(void)
     }
     if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_gate") == NULL) {
         g_eng->pfnRegisterVariable("mv_gate", "0", FCVAR_ARCHIVE);
+    }
+    if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_vu_l") == NULL) {
+        g_eng->pfnRegisterVariable("mv_vu_l", "0", 0);
+    }
+    if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_vu_r") == NULL) {
+        g_eng->pfnRegisterVariable("mv_vu_r", "0", 0);
     }
 }
 
