@@ -12,7 +12,8 @@ It does **not** go through the Windows recording mixer for the settings we own. 
 - Forces the native Speex + WaveIn path (RevEmu/Steam voice stub is skipped).
 - Opens capture only when you talk or test the mic; closes it after, so Bluetooth can return to A2DP.
 - Rebuilds codec + recorder after a level change (stock GoldSrc never does).
-- Registers software-gain cvars for the Options UI (values persist; DSP gain in the capture buffer is the next step).
+- Applies `mv_gain` / `mv_boost` in software on 16-bit PCM **before** Speex (Windows recording mixer is pinned to unity so it is not a second fader).
+- Registers those cvars for the Options UI (`FCVAR_ARCHIVE` → `config.cfg`).
 
 ## Cvars
 
@@ -46,9 +47,8 @@ MetaVoice.dll
 
 ## Roadmap
 
-1. Apply `mv_gain` / `mv_boost` in software on 16-bit PCM **before** Speex (no Windows mixer).
-2. Noise gate (`mv_gate`) so keyboard/breath is not sent.
-3. Capture device pick if more than one mic is present.
+1. Noise gate (`mv_gate`) so keyboard/breath is not sent.
+2. Capture device pick if more than one mic is present.
 
 Per-player **incoming** voice volume (Next Client style) is a playback-side feature, not this plugin.
 

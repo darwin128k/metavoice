@@ -1,5 +1,6 @@
 #include <metahook.h>
 #include <cvardef.h>
+#include <ivoicetweak.h>
 #include <mmsystem.h>
 #include <stdio.h>
 #include <time.h>
@@ -93,10 +94,19 @@ static const unsigned char kReplacement[2] = { 0x33, 0xC0 }; /* XOR EAX,EAX */
 /* VoiceRecord_WaveIn::Init -- reached via a direct CALL, not virtual. */
 #define VOICE_WAVEIN_INIT_RVA 0x000C4C50u
 
+/* VoiceRecord_WaveIn vtable (RTTI ".?AVVoiceRecord_WaveIn@@"). GetMoreData
+ * is vtable+0x14: thiscall (short *buf, int nSamples), ret 8, returns the
+ * number of 16-bit samples written. Same slot on DSound. */
+#define VOICE_WAVEIN_VTABLE_RVA 0x0011F138u
+#define VOICE_GETMOREDATA_SLOT 0x14u
+
 /* VoiceRecord_DSound::Init -- vtable+0x18, vtable resolved via its RTTI
  * Complete Object Locator (".?AVVoiceRecord_DSound@@") with Ghidra. */
 #define VOICE_DSOUND_VTABLE_RVA 0x0011F0FCu
 #define VOICE_DSOUND_VTABLE_INIT_SLOT 0x18u
+
+/* Windows "Mic Boost" is +20 dB. Keep the same extra when mv_boost is on. */
+#define MV_BOOST_LINEAR 10.0f
 
 /* FUN_01dc33e0 -- the release-side counterpart called from -voicerecord
  * and from the Options "Stop Microphone Test" button: flushes the
@@ -134,12 +144,15 @@ static const unsigned char kReplacement[2] = { 0x33, 0xC0 }; /* XOR EAX,EAX */
 static const char kVoiceCodecName[] = "voice_speex";
 
 typedef int (__fastcall *ClassInitFn)(void *pThis, void *edx, DWORD sampleRate);
+typedef int (__fastcall *GetMoreDataFn)(void *pThis, void *edx, short *buf, int nSamples);
 typedef int (__cdecl *EngageFn)(void);
 typedef void (__cdecl *ShutdownFn)(void);
 typedef int (__cdecl *ReinitVoiceFn)(const char *name, int flag);
 
 static ClassInitFn g_origWaveInInit = NULL;
 static ClassInitFn g_origDSoundInit = NULL;
+static GetMoreDataFn g_origWaveInGetMoreData = NULL;
+static GetMoreDataFn g_origDSoundGetMoreData = NULL;
 static EngageFn g_origEngage = NULL;
 static EngageFn g_origRelease = NULL;
 static ShutdownFn g_origShutdown = NULL;
@@ -156,6 +169,101 @@ cl_exportfuncs_t gExportfuncs = { 0 };
 mh_interface_t *g_pInterface = NULL;
 metahook_api_t *g_pMetaHookAPI = NULL;
 mh_enginesave_t *g_pMetaSave = NULL;
+
+static float CvarValueOr(const char *name, float fallback)
+{
+    cvar_t *cv;
+
+    if (g_eng == NULL || g_eng->pfnGetCvarPointer == NULL || name == NULL) {
+        return fallback;
+    }
+    cv = g_eng->pfnGetCvarPointer(name);
+    if (cv == NULL) {
+        return fallback;
+    }
+    return cv->value;
+}
+
+static void PinWindowsMixerUnity(void)
+{
+    IVoiceTweak *tweak;
+
+    if (g_eng == NULL) {
+        return;
+    }
+    tweak = g_eng->pVoiceTweak;
+    if (tweak == NULL || tweak->SetControlFloat == NULL) {
+        return;
+    }
+    /* Capture stays at full hardware scale. Transmit/boost are applied
+     * in ApplyCaptureGain on the PCM the engine already pulled. */
+    tweak->SetControlFloat(MicrophoneVolume, 1.0f);
+    tweak->SetControlFloat(MicBoost, 0.0f);
+}
+
+static void ApplyCaptureGain(short *buf, int nSamples)
+{
+    float gain;
+    float boost;
+    float scale;
+    int i;
+
+    if (buf == NULL || nSamples <= 0) {
+        return;
+    }
+
+    gain = CvarValueOr("mv_gain", 1.0f);
+    if (gain < 0.0f) {
+        gain = 0.0f;
+    }
+    if (gain > 1.0f) {
+        gain = 1.0f;
+    }
+
+    boost = 1.0f;
+    if (CvarValueOr("mv_boost", 0.0f) > 0.5f) {
+        boost = MV_BOOST_LINEAR;
+    }
+
+    scale = gain * boost;
+    if (scale == 1.0f) {
+        return;
+    }
+
+    for (i = 0; i < nSamples; i++) {
+        int v = (int)((float)buf[i] * scale);
+        if (v > 32767) {
+            v = 32767;
+        } else if (v < -32768) {
+            v = -32768;
+        }
+        buf[i] = (short)v;
+    }
+}
+
+static int __fastcall Hook_WaveInGetMoreData(void *pThis, void *edx, short *buf, int nSamples)
+{
+    int n;
+
+    if (g_origWaveInGetMoreData == NULL) {
+        return 0;
+    }
+    n = g_origWaveInGetMoreData(pThis, edx, buf, nSamples);
+    ApplyCaptureGain(buf, n);
+    return n;
+}
+
+static int __fastcall Hook_DSoundGetMoreData(void *pThis, void *edx, short *buf, int nSamples)
+{
+    int n;
+
+    if (g_origDSoundGetMoreData == NULL) {
+        return 0;
+    }
+    n = g_origDSoundGetMoreData(pThis, edx, buf, nSamples);
+    ApplyCaptureGain(buf, n);
+    return n;
+}
 
 static void ForceWaveIn(void)
 {
@@ -265,6 +373,7 @@ static int __cdecl Hook_Engage(void)
             g_origWaveInInit(g_pRecorder, NULL, g_sampleRate);
         }
         g_hwOpened = true;
+        PinWindowsMixerUnity();
     }
     int ret = g_origEngage();
     _snprintf(dbg, sizeof(dbg), "MetaVoice: Engage orig returned %d", ret);
@@ -394,6 +503,8 @@ static void InstallDeferredMicHooks(void)
     void *shutdownAddr = base + VOICE_SHUTDOWN_RVA;
     void *reinitAddr = base + VOICE_REINIT_RVA;
     BYTE **dsoundVtableSlot = (BYTE **)(base + VOICE_DSOUND_VTABLE_RVA + VOICE_DSOUND_VTABLE_INIT_SLOT);
+    BYTE **waveInGetMore = (BYTE **)(base + VOICE_WAVEIN_VTABLE_RVA + VOICE_GETMOREDATA_SLOT);
+    BYTE **dsoundGetMore = (BYTE **)(base + VOICE_DSOUND_VTABLE_RVA + VOICE_GETMOREDATA_SLOT);
     DWORD oldProtect;
 
     g_pMetaHookAPI->InlineHook(reinitAddr, (void *)Hook_ReinitVoice, (void **)&g_origReinitVoice);
@@ -409,6 +520,18 @@ static void InstallDeferredMicHooks(void)
         g_origDSoundInit = (ClassInitFn)*dsoundVtableSlot;
         *dsoundVtableSlot = (BYTE *)Hook_DSoundInit;
         VirtualProtect(dsoundVtableSlot, sizeof(void *), oldProtect, &oldProtect);
+    }
+
+    if (VirtualProtect(waveInGetMore, sizeof(void *), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        g_origWaveInGetMoreData = (GetMoreDataFn)*waveInGetMore;
+        *waveInGetMore = (BYTE *)Hook_WaveInGetMoreData;
+        VirtualProtect(waveInGetMore, sizeof(void *), oldProtect, &oldProtect);
+    }
+
+    if (VirtualProtect(dsoundGetMore, sizeof(void *), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        g_origDSoundGetMoreData = (GetMoreDataFn)*dsoundGetMore;
+        *dsoundGetMore = (BYTE *)Hook_DSoundGetMoreData;
+        VirtualProtect(dsoundGetMore, sizeof(void *), oldProtect, &oldProtect);
     }
 
     g_pMetaHookAPI->InlineHook(shutdownAddr, (void *)Hook_Shutdown, (void **)&g_origShutdown);
@@ -458,7 +581,7 @@ void IPluginsV4::ExitGame(int iResult)
 
 const char *IPluginsV4::GetVersion(void)
 {
-    return "0.1.0";
+    return "0.2.0";
 }
 
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
