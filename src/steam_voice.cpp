@@ -488,21 +488,18 @@ int SteamUserVoiceHook::DecompressVoice(const void *comp, unsigned int compBytes
 
     {
         unsigned long long pktSid = 0;
-        float gain;
+        float gain = 1.0f;
 
         memcpy(&pktSid, comp, 8);
-        /* Own packets are local monitor / server echo — duck hard or laptop
-         * speakers next to the mic howl (Opus ×gain made Test Mic worse). */
+        /* Remote loudness = Options "Voice receive". Only own echo uses Voice monitor. */
         if (pktSid == g_sid) {
-            gain = MetaVoice_CvarOr("mv_monitor", 0.22f);
-        } else {
-            gain = MetaVoice_CvarOr("mv_rx", 2.0f);
-        }
-        if (gain < 0.0f) {
-            gain = 0.0f;
-        }
-        if (gain > 8.0f) {
-            gain = 8.0f;
+            gain = MetaVoice_CvarOr("mv_monitor", 1.0f);
+            if (gain < 0.0f) {
+                gain = 0.0f;
+            }
+            if (gain > 1.0f) {
+                gain = 1.0f;
+            }
         }
 
         for (i = 0; i < nOut; i++) {

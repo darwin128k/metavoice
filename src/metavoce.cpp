@@ -842,9 +842,16 @@ static int Hook_StartVoiceTweak(void)
 
     tweak = (g_eng != NULL) ? g_eng->pVoiceTweak : NULL;
     if (tweak != NULL && tweak->GetControlFloat != NULL && tweak->SetControlFloat != NULL) {
+        float mon = CvarValueOr("mv_monitor", 1.0f);
+        if (mon < 0.0f) {
+            mon = 0.0f;
+        }
+        if (mon > 1.0f) {
+            mon = 1.0f;
+        }
         g_savedOtherSpeaker = tweak->GetControlFloat(OtherSpeakerScale);
-        /* Quiet the tweak echo so built-in speakers next to the mic don't howl. */
-        tweak->SetControlFloat(OtherSpeakerScale, 0.28f);
+        /* Speex Test Mic echo uses OtherSpeakerScale — drive it from Voice monitor. */
+        tweak->SetControlFloat(OtherSpeakerScale, mon);
     }
 
     Log("MetaVoice: VoiceTweak start");
@@ -903,11 +910,8 @@ static void RegisterGainCvars(void)
     if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_gate") == NULL) {
         g_eng->pfnRegisterVariable("mv_gate", "0", FCVAR_ARCHIVE);
     }
-    if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_rx") == NULL) {
-        g_eng->pfnRegisterVariable("mv_rx", "2.0", FCVAR_ARCHIVE);
-    }
     if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_monitor") == NULL) {
-        g_eng->pfnRegisterVariable("mv_monitor", "0.22", FCVAR_ARCHIVE);
+        g_eng->pfnRegisterVariable("mv_monitor", "1.0", FCVAR_ARCHIVE);
     }
     if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_vu_l") == NULL) {
         g_eng->pfnRegisterVariable("mv_vu_l", "0", 0);
@@ -940,7 +944,7 @@ void IPluginsV4::ExitGame(int iResult)
 
 const char *IPluginsV4::GetVersion(void)
 {
-    return "0.4.6";
+    return "0.4.8";
 }
 
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
