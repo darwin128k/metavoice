@@ -828,6 +828,7 @@ void IPluginsV4::Shutdown(void)
 static int (*g_origStartVoiceTweak)(void) = NULL;
 static void (*g_origEndVoiceTweak)(void) = NULL;
 static float g_savedOtherSpeaker = 1.0f;
+static int g_haveSavedOtherSpeaker = 0;
 
 static int Hook_StartVoiceTweak(void)
 {
@@ -835,23 +836,22 @@ static int Hook_StartVoiceTweak(void)
     int ok;
 
     SteamVoice_SetTweakMode(1);
-    /* Speex local monitor + Steam flag off avoids Opus×gain feedback on laptops. */
+    /* Speex local monitor + Steam flag off avoids Opus feedback on laptop speakers. */
     SteamVoice_SetSteamFlag(0);
+
+    /* Voice receive IS OtherSpeakerScale — never overwrite it with mv_monitor
+     * (that made the Receive slider jump during Test Microphone). */
+    tweak = (g_eng != NULL) ? g_eng->pVoiceTweak : NULL;
+    g_haveSavedOtherSpeaker = 0;
+    if (tweak != NULL && tweak->GetControlFloat != NULL) {
+        g_savedOtherSpeaker = tweak->GetControlFloat(OtherSpeakerScale);
+        g_haveSavedOtherSpeaker = 1;
+    }
 
     ok = (g_origStartVoiceTweak != NULL) ? g_origStartVoiceTweak() : 0;
 
-    tweak = (g_eng != NULL) ? g_eng->pVoiceTweak : NULL;
-    if (tweak != NULL && tweak->GetControlFloat != NULL && tweak->SetControlFloat != NULL) {
-        float mon = CvarValueOr("mv_monitor", 1.0f);
-        if (mon < 0.0f) {
-            mon = 0.0f;
-        }
-        if (mon > 1.0f) {
-            mon = 1.0f;
-        }
-        g_savedOtherSpeaker = tweak->GetControlFloat(OtherSpeakerScale);
-        /* Speex Test Mic echo uses OtherSpeakerScale — drive it from Voice monitor. */
-        tweak->SetControlFloat(OtherSpeakerScale, mon);
+    if (g_haveSavedOtherSpeaker && tweak != NULL && tweak->SetControlFloat != NULL) {
+        tweak->SetControlFloat(OtherSpeakerScale, g_savedOtherSpeaker);
     }
 
     Log("MetaVoice: VoiceTweak start");
@@ -867,9 +867,10 @@ static void Hook_EndVoiceTweak(void)
     }
 
     tweak = (g_eng != NULL) ? g_eng->pVoiceTweak : NULL;
-    if (tweak != NULL && tweak->SetControlFloat != NULL) {
+    if (g_haveSavedOtherSpeaker && tweak != NULL && tweak->SetControlFloat != NULL) {
         tweak->SetControlFloat(OtherSpeakerScale, g_savedOtherSpeaker);
     }
+    g_haveSavedOtherSpeaker = 0;
 
     SteamVoice_SetTweakMode(0);
     if (IsInGameMap()) {
@@ -944,7 +945,7 @@ void IPluginsV4::ExitGame(int iResult)
 
 const char *IPluginsV4::GetVersion(void)
 {
-    return "0.4.8";
+    return "0.4.9";
 }
 
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
