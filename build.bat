@@ -2,7 +2,6 @@
 setlocal
 cd /d "%~dp0"
 for %%I in ("%CD%") do set "MV=%%~fI\"
-for %%I in ("%MV%..") do set "PARENT=%%~fI"
 
 set VCVARS="C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars32.bat"
 call %VCVARS% >nul
@@ -24,10 +23,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if exist "%PARENT%\cstrike\metahook\plugins" (
-    copy /Y "%BIN%\Release\MetaVoice.dll" "%PARENT%\cstrike\metahook\plugins\" >nul
-    echo Build OK: MetaVoice.dll -^> cstrike\metahook\plugins
-) else (
-    echo Build OK: %BIN%\Release\MetaVoice.dll
-)
+echo Build OK: %BIN%\Release\MetaVoice.dll
 endlocal
