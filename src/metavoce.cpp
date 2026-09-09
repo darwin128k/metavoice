@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include "steam_voice.h"
 
 static void Log(const char *msg)
 {
@@ -17,6 +18,11 @@ static void Log(const char *msg)
         fprintf(f, "[%02d:%02d:%02d] %s\n", lt->tm_hour, lt->tm_min, lt->tm_sec, msg);
         fclose(f);
     }
+}
+
+void MetaVoice_Log(const char *msg)
+{
+    Log(msg);
 }
 
 /* hw.dll's Host_Init calls a codec-init helper as
@@ -56,6 +62,16 @@ static const unsigned char kReplacement[2] = { 0x33, 0xC0 }; /* XOR EAX,EAX */
  * recorder is only constructed once (or, with our reinit hook, each time
  * FUN_01dc2c00 reruns), always reading this value at that moment. */
 #define DAT_VOICE_DSOUND_VALUE_RVA 0x0015DFE0u
+/* BYTE DAT_01e5e180: "Steam voice available". FUN_01dc2c00 writes it
+ * from SteamUser()!=0 (we XOR that one TEST so native Speex+WaveIn
+ * still constructs). The per-frame send pump FUN_01dc3500 reads the
+ * same byte first: if it is 1, it calls ISteamUser::GetVoice and never
+ * VoiceRecord::GetMoreData / Speex. RevEmu leaves SteamUser non-null
+ * and GetVoice empty, so the other player sees the talking icon and
+ * hears silence — while Options VU still moves, because IVoiceTweak
+ * reads WaveIn directly. Force the flag off wherever we already force
+ * WaveIn. */
+#define DAT_VOICE_STEAM_FLAG_RVA 0x0015E180u
 
 /* DAT_01e5dfb4: a plain DWORD (not a cvar_t.value float -- it sits
  * before voice_dsound's own cvar_t struct and is read and passed
@@ -146,6 +162,7 @@ static const unsigned char kReplacement[2] = { 0x33, 0xC0 }; /* XOR EAX,EAX */
  * takes the native path again every time. */
 #define VOICE_SHUTDOWN_RVA 0x000C2F00u
 #define VOICE_REINIT_RVA 0x000C2C00u
+#define VOICE_SEND_PUMP_RVA 0x000C3500u
 static const char kVoiceCodecName[] = "voice_speex";
 
 typedef int (__fastcall *ClassInitFn)(void *pThis, void *edx, DWORD sampleRate);
@@ -153,6 +170,7 @@ typedef int (__fastcall *GetMoreDataFn)(void *pThis, void *edx, short *buf, int 
 typedef int (__cdecl *EngageFn)(void);
 typedef void (__cdecl *ShutdownFn)(void);
 typedef int (__cdecl *ReinitVoiceFn)(const char *name, int flag);
+typedef int (__cdecl *VoicePumpFn)(void *dst, unsigned int cb);
 
 static ClassInitFn g_origWaveInInit = NULL;
 static ClassInitFn g_origDSoundInit = NULL;
@@ -162,6 +180,7 @@ static EngageFn g_origEngage = NULL;
 static EngageFn g_origRelease = NULL;
 static ShutdownFn g_origShutdown = NULL;
 static ReinitVoiceFn g_origReinitVoice = NULL;
+static VoicePumpFn g_origVoicePump = NULL;
 
 static void *g_pRecorder = NULL;
 static DWORD g_sampleRate = 0;
@@ -176,6 +195,12 @@ static float g_vuHoldR = 0.0f;
 
 static void CloseWaveInHardware(void *pThis);
 static void PinWindowsMixerUnity(void);
+static void ForceWaveIn(void);
+static int IsInGameMap(void);
+int MetaVoice_PullCapturePcm(short *buf, int maxSamples);
+unsigned MetaVoice_CaptureRate(void);
+int MetaVoice_MicOpen(void);
+BYTE *MetaVoice_EngineBase(void);
 
 cl_exportfuncs_t gExportfuncs = { 0 };
 mh_interface_t *g_pInterface = NULL;
@@ -194,6 +219,11 @@ static float CvarValueOr(const char *name, float fallback)
         return fallback;
     }
     return cv->value;
+}
+
+float MetaVoice_CvarOr(const char *name, float fallback)
+{
+    return CvarValueOr(name, fallback);
 }
 
 static void ApplyNoiseGate(short *buf, int nSamples)
@@ -380,6 +410,40 @@ static void ApplyCaptureGain(short *buf, int nSamples)
     UpdateVuMeters(buf, nSamples);
 }
 
+int MetaVoice_PullCapturePcm(short *buf, int maxSamples)
+{
+    int n = 0;
+
+    if (buf == NULL || maxSamples <= 0 || !g_hwOpened || g_pRecorder == NULL) {
+        return 0;
+    }
+    if (g_isDSound && g_origDSoundGetMoreData != NULL) {
+        n = g_origDSoundGetMoreData(g_pRecorder, NULL, buf, maxSamples);
+    } else if (g_origWaveInGetMoreData != NULL) {
+        n = g_origWaveInGetMoreData(g_pRecorder, NULL, buf, maxSamples);
+    }
+    ApplyCaptureGain(buf, n);
+    return n;
+}
+
+unsigned MetaVoice_CaptureRate(void)
+{
+    return (unsigned)g_sampleRate;
+}
+
+int MetaVoice_MicOpen(void)
+{
+    return g_hwOpened ? 1 : 0;
+}
+
+BYTE *MetaVoice_EngineBase(void)
+{
+    if (g_pMetaHookAPI == NULL) {
+        return NULL;
+    }
+    return (BYTE *)g_pMetaHookAPI->GetEngineBase();
+}
+
 static int __fastcall Hook_WaveInGetMoreData(void *pThis, void *edx, short *buf, int nSamples)
 {
     int n;
@@ -388,7 +452,11 @@ static int __fastcall Hook_WaveInGetMoreData(void *pThis, void *edx, short *buf,
         return 0;
     }
     n = g_origWaveInGetMoreData(pThis, edx, buf, nSamples);
+    ForceWaveIn();
     ApplyCaptureGain(buf, n);
+    if (n > 0) {
+        SteamVoice_PushPcm(buf, n, (unsigned)g_sampleRate);
+    }
     return n;
 }
 
@@ -400,7 +468,11 @@ static int __fastcall Hook_DSoundGetMoreData(void *pThis, void *edx, short *buf,
         return 0;
     }
     n = g_origDSoundGetMoreData(pThis, edx, buf, nSamples);
+    ForceWaveIn();
     ApplyCaptureGain(buf, n);
+    if (n > 0) {
+        SteamVoice_PushPcm(buf, n, (unsigned)g_sampleRate);
+    }
     return n;
 }
 
@@ -408,12 +480,6 @@ static void ForceWaveIn(void)
 {
     BYTE *base = (BYTE *)g_pMetaHookAPI->GetEngineBase();
     *(float *)(base + DAT_VOICE_DSOUND_VALUE_RVA) = 0.0f;
-    /* Tried forcing DAT_VOICE_SAMPLERATE_RVA to 8000 (HFP's native CVSD
-     * rate) on the theory that a mismatched WaveIn request rate was
-     * behind the choppy capture -- it made things drastically worse
-     * (max amplitude ~9, i.e. near silence, vs ~3700 at 11025), so this
-     * device apparently does not do real 8kHz WaveIn capture at all.
-     * Leaving the engine's own default (11025) alone. */
 }
 
 static void PatchVoiceSpeexGate(void)
@@ -423,6 +489,7 @@ static void PatchVoiceSpeexGate(void)
     DWORD oldProtect;
 
     if (memcmp(target, kExpected, sizeof(kExpected)) != 0) {
+        Log("MetaVoice: Speex SteamUser patch skipped (hw.dll bytes mismatch)");
         return;
     }
 
@@ -434,6 +501,7 @@ static void PatchVoiceSpeexGate(void)
 
     VirtualProtect(target, sizeof(kReplacement), oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), target, sizeof(kReplacement));
+    Log("MetaVoice: Speex SteamUser patch applied");
 }
 
 static int __fastcall Hook_WaveInInit(void *pThis, void *edx, DWORD sampleRate)
@@ -484,6 +552,7 @@ static int __cdecl Hook_Engage(void)
               g_pRecorder, (int)g_isDSound, (int)g_hwOpened, (int)g_recorderEverBuilt);
     dbg[sizeof(dbg) - 1] = '\0';
     Log(dbg);
+    ForceWaveIn();
 
     if (g_pRecorder == NULL && g_recorderEverBuilt && g_origReinitVoice != NULL) {
         /* A voice shutdown (level change/disconnect) destroyed both the
@@ -514,8 +583,17 @@ static int __cdecl Hook_Engage(void)
         g_hwOpened = true;
         PinWindowsMixerUnity();
     }
-    int ret = g_origEngage();
-    _snprintf(dbg, sizeof(dbg), "MetaVoice: Engage orig returned %d", ret);
+
+    /* Steam flag must be 0 for Engage: otherwise hw skips VoiceRecord::RecordStart
+     * and WaveIn never arms — mic stays dead for K and Test Microphone. */
+    SteamVoice_SetSteamFlag(0);
+    SteamVoice_SetInGame(IsInGameMap());
+    SteamVoice_OnEngage();
+    int ret = g_origEngage() & 0xFF;
+    if (IsInGameMap()) {
+        SteamVoice_SetSteamFlag(1);
+    }
+    _snprintf(dbg, sizeof(dbg), "MetaVoice: Engage orig returned %d inGame=%d", ret, IsInGameMap());
     dbg[sizeof(dbg) - 1] = '\0';
     Log(dbg);
     return ret;
@@ -581,7 +659,9 @@ static void CloseWaveInHardware(void *pThis)
 
 static int __cdecl Hook_Release(void)
 {
-    int ret = g_origRelease();
+    /* Same as Engage: native RecordStop only runs when Steam flag is off. */
+    SteamVoice_SetSteamFlag(0);
+    int ret = g_origRelease() & 0xFF;
     char dbg[128];
     _snprintf(dbg, sizeof(dbg), "MetaVoice: Release recorder=%p isDSound=%d hwOpened=%d origReturned=%d",
               g_pRecorder, (int)g_isDSound, (int)g_hwOpened, ret);
@@ -597,6 +677,10 @@ static int __cdecl Hook_Release(void)
             CloseWaveInHardware(g_pRecorder);
         }
         g_hwOpened = false;
+    }
+    SteamVoice_OnRelease();
+    if (IsInGameMap()) {
+        SteamVoice_SetSteamFlag(1);
     }
     return ret;
 }
@@ -631,6 +715,58 @@ static void __cdecl Hook_Shutdown(void)
 
     g_pRecorder = NULL;
     g_hwOpened = false;
+    SteamVoice_Shutdown();
+}
+
+static int IsInGameMap(void)
+{
+    const char *lvl;
+
+    if (g_eng == NULL || g_eng->pfnGetLevelName == NULL) {
+        return 0;
+    }
+    lvl = g_eng->pfnGetLevelName();
+    if (lvl == NULL || lvl[0] == '\0') {
+        return 0;
+    }
+    /* Menu / not connected often reports ".bsp" empty stem or just extension. */
+    if (lvl[0] == '.' || (lvl[0] == 'c' && lvl[1] == '\0')) {
+        return 0;
+    }
+    return 1;
+}
+
+static void __cdecl Hook_HUD_Frame(double time)
+{
+    if (IsInGameMap() && !SteamVoice_IsTweakMode()) {
+        SteamVoice_SetInGame(1);
+        SteamVoice_EnableSteamReceive();
+        /* Keep Steam receive path armed without requiring a prior +voicerecord. */
+        SteamVoice_SetSteamFlag(1);
+    }
+    if (gExportfuncs.HUD_Frame != NULL) {
+        gExportfuncs.HUD_Frame(time);
+    }
+}
+
+static int __cdecl Hook_VoicePump(void *dst, unsigned int cb)
+{
+    int n;
+
+    SteamVoice_SetInGame(IsInGameMap());
+    n = SteamVoice_WritePacket(dst, cb);
+    if (n > 0) {
+        return n;
+    }
+    /* n == 0: armed but silence this tick — do not fall back to Speex
+     * (would flash a second codec). n < 0: mic test / menu → Speex. */
+    if (n == 0 && SteamVoice_WantSteamSend()) {
+        return 0;
+    }
+    if (g_origVoicePump == NULL) {
+        return 0;
+    }
+    return g_origVoicePump(dst, cb);
 }
 
 static void InstallDeferredMicHooks(void)
@@ -641,12 +777,14 @@ static void InstallDeferredMicHooks(void)
     void *waveInInitAddr = base + VOICE_WAVEIN_INIT_RVA;
     void *shutdownAddr = base + VOICE_SHUTDOWN_RVA;
     void *reinitAddr = base + VOICE_REINIT_RVA;
+    void *pumpAddr = base + VOICE_SEND_PUMP_RVA;
     BYTE **dsoundVtableSlot = (BYTE **)(base + VOICE_DSOUND_VTABLE_RVA + VOICE_DSOUND_VTABLE_INIT_SLOT);
     BYTE **waveInGetMore = (BYTE **)(base + VOICE_WAVEIN_VTABLE_RVA + VOICE_GETMOREDATA_SLOT);
     BYTE **dsoundGetMore = (BYTE **)(base + VOICE_DSOUND_VTABLE_RVA + VOICE_GETMOREDATA_SLOT);
     DWORD oldProtect;
 
     g_pMetaHookAPI->InlineHook(reinitAddr, (void *)Hook_ReinitVoice, (void **)&g_origReinitVoice);
+    g_pMetaHookAPI->InlineHook(pumpAddr, (void *)Hook_VoicePump, (void **)&g_origVoicePump);
 
     if (g_pMetaHookAPI->InlineHook(engageAddr, (void *)Hook_Engage, (void **)&g_origEngage) == NULL) {
         return;
@@ -687,6 +825,70 @@ void IPluginsV4::Shutdown(void)
 {
 }
 
+static int (*g_origStartVoiceTweak)(void) = NULL;
+static void (*g_origEndVoiceTweak)(void) = NULL;
+static float g_savedOtherSpeaker = 1.0f;
+
+static int Hook_StartVoiceTweak(void)
+{
+    IVoiceTweak *tweak;
+    int ok;
+
+    SteamVoice_SetTweakMode(1);
+    /* Speex local monitor + Steam flag off avoids Opus×gain feedback on laptops. */
+    SteamVoice_SetSteamFlag(0);
+
+    ok = (g_origStartVoiceTweak != NULL) ? g_origStartVoiceTweak() : 0;
+
+    tweak = (g_eng != NULL) ? g_eng->pVoiceTweak : NULL;
+    if (tweak != NULL && tweak->GetControlFloat != NULL && tweak->SetControlFloat != NULL) {
+        g_savedOtherSpeaker = tweak->GetControlFloat(OtherSpeakerScale);
+        /* Quiet the tweak echo so built-in speakers next to the mic don't howl. */
+        tweak->SetControlFloat(OtherSpeakerScale, 0.28f);
+    }
+
+    Log("MetaVoice: VoiceTweak start");
+    return ok;
+}
+
+static void Hook_EndVoiceTweak(void)
+{
+    IVoiceTweak *tweak;
+
+    if (g_origEndVoiceTweak != NULL) {
+        g_origEndVoiceTweak();
+    }
+
+    tweak = (g_eng != NULL) ? g_eng->pVoiceTweak : NULL;
+    if (tweak != NULL && tweak->SetControlFloat != NULL) {
+        tweak->SetControlFloat(OtherSpeakerScale, g_savedOtherSpeaker);
+    }
+
+    SteamVoice_SetTweakMode(0);
+    if (IsInGameMap()) {
+        SteamVoice_SetSteamFlag(1);
+    }
+    Log("MetaVoice: VoiceTweak end");
+}
+
+static void HookVoiceTweakApi(void)
+{
+    IVoiceTweak *tweak;
+
+    if (g_eng == NULL || g_eng->pVoiceTweak == NULL) {
+        return;
+    }
+    tweak = g_eng->pVoiceTweak;
+    if (tweak->StartVoiceTweakMode == Hook_StartVoiceTweak) {
+        return;
+    }
+    g_origStartVoiceTweak = tweak->StartVoiceTweakMode;
+    g_origEndVoiceTweak = tweak->EndVoiceTweakMode;
+    tweak->StartVoiceTweakMode = Hook_StartVoiceTweak;
+    tweak->EndVoiceTweakMode = Hook_EndVoiceTweak;
+    Log("MetaVoice: IVoiceTweak hooked");
+}
+
 static void RegisterGainCvars(void)
 {
     if (g_eng == NULL || g_eng->pfnRegisterVariable == NULL) {
@@ -701,6 +903,12 @@ static void RegisterGainCvars(void)
     if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_gate") == NULL) {
         g_eng->pfnRegisterVariable("mv_gate", "0", FCVAR_ARCHIVE);
     }
+    if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_rx") == NULL) {
+        g_eng->pfnRegisterVariable("mv_rx", "2.0", FCVAR_ARCHIVE);
+    }
+    if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_monitor") == NULL) {
+        g_eng->pfnRegisterVariable("mv_monitor", "0.22", FCVAR_ARCHIVE);
+    }
     if (g_eng->pfnGetCvarPointer == NULL || g_eng->pfnGetCvarPointer("mv_vu_l") == NULL) {
         g_eng->pfnRegisterVariable("mv_vu_l", "0", 0);
     }
@@ -714,12 +922,15 @@ void IPluginsV4::LoadEngine(cl_enginefunc_t *pEngineFuncs)
     g_eng = pEngineFuncs;
     PatchVoiceSpeexGate();
     InstallDeferredMicHooks();
+    SteamVoice_EnableSteamReceive();
 }
 
 void IPluginsV4::LoadClient(cl_exportfuncs_t *pExportFuncs)
 {
     memcpy(&gExportfuncs, pExportFuncs, sizeof(gExportfuncs));
+    pExportFuncs->HUD_Frame = Hook_HUD_Frame;
     RegisterGainCvars();
+    HookVoiceTweakApi();
 }
 
 void IPluginsV4::ExitGame(int iResult)
@@ -729,7 +940,7 @@ void IPluginsV4::ExitGame(int iResult)
 
 const char *IPluginsV4::GetVersion(void)
 {
-    return "0.3.0";
+    return "0.4.6";
 }
 
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
