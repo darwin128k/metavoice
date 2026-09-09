@@ -5,24 +5,16 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include "steam_voice.h"
 
 static void Log(const char *msg)
 {
-    OutputDebugStringA(msg);
-    FILE *f = fopen("metavoce.log", "a");
-    if (f != NULL) {
-        time_t t = time(NULL);
-        struct tm *lt = localtime(&t);
-        fprintf(f, "[%02d:%02d:%02d] %s\n", lt->tm_hour, lt->tm_min, lt->tm_sec, msg);
-        fclose(f);
-    }
+    (void)msg;
 }
 
 void MetaVoice_Log(const char *msg)
 {
-    Log(msg);
+    (void)msg;
 }
 
 /* hw.dll's Host_Init calls a codec-init helper as
